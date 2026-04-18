@@ -51,17 +51,18 @@ public class PlayFlowLobbyManagerV2Editor : Editor
                 EditorGUILayout.LabelField("Status:", currentLobby.status);
                 EditorGUILayout.LabelField("Players:", $"{currentLobby.currentPlayers} / {currentLobby.maxPlayers}");
                 EditorGUILayout.LabelField("Is Private:", currentLobby.isPrivate.ToString());
-                EditorGUILayout.LabelField("Invite Code:", currentLobby.inviteCode ?? "N/A");
+                EditorGUILayout.LabelField("Invite Code:", currentLobby.code ?? "N/A");
                 EditorGUILayout.Space(5);
 
                 // Current Lobby Players
-                _showCurrentLobbyPlayers = EditorGUILayout.Foldout(_showCurrentLobbyPlayers, $"Players ({currentLobby.players?.Length ?? 0})", true, EditorStyles.foldout);
+                _showCurrentLobbyPlayers = EditorGUILayout.Foldout(_showCurrentLobbyPlayers, $"Players ({currentLobby.players?.Count ?? 0})", true, EditorStyles.foldout);
                 if (_showCurrentLobbyPlayers && currentLobby.players != null)
                 {
                     EditorGUI.indentLevel++;
-                    foreach (string playerId in currentLobby.players)
+                    foreach (var player in currentLobby.players)
                     {
-                        EditorGUILayout.LabelField("- " + playerId + (playerId == manager.PlayerId ? " (You)" : "") + (playerId == currentLobby.host ? " (Host)" : ""));
+                        var pid = player.id;
+                        EditorGUILayout.LabelField("- " + pid + (pid == manager.PlayerId ? " (You)" : "") + (player.isHost ? " (Host)" : ""));
                     }
                     EditorGUI.indentLevel--;
                 }
@@ -88,16 +89,29 @@ public class PlayFlowLobbyManagerV2Editor : Editor
                 _showCurrentLobbyGameServer = EditorGUILayout.Foldout(_showCurrentLobbyGameServer, "Game Server Info", true, EditorStyles.foldout);
                 if (_showCurrentLobbyGameServer)
                 {
-                     if (currentLobby.gameServer != null && currentLobby.gameServer.Count > 0)
+                    EditorGUI.indentLevel++;
+                    if (currentLobby.server != null)
                     {
-                        DisplayDictionary(currentLobby.gameServer, "gameServer");
+                        EditorGUILayout.LabelField("Instance ID:", currentLobby.server.instance_id ?? "N/A");
+                        EditorGUILayout.LabelField("Status:", currentLobby.server.status ?? "N/A");
+                        EditorGUILayout.LabelField("Region:", currentLobby.server.region ?? "N/A");
+                        EditorGUILayout.LabelField("Compute size:", currentLobby.server.compute_size ?? "N/A");
+                        if (currentLobby.server.network_ports != null && currentLobby.server.network_ports.Count > 0)
+                        {
+                            EditorGUILayout.LabelField($"Ports ({currentLobby.server.network_ports.Count}):");
+                            EditorGUI.indentLevel++;
+                            foreach (var p in currentLobby.server.network_ports)
+                            {
+                                EditorGUILayout.LabelField($"- {p.name} {p.protocol}://{p.host}:{p.external_port} (internal {p.internal_port})");
+                            }
+                            EditorGUI.indentLevel--;
+                        }
                     }
                     else
                     {
-                        EditorGUI.indentLevel++;
                         EditorGUILayout.LabelField("No game server info.");
-                        EditorGUI.indentLevel--;
                     }
+                    EditorGUI.indentLevel--;
                 }
             }
             else

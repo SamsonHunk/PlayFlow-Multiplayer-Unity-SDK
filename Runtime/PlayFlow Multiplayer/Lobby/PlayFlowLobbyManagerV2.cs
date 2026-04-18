@@ -15,10 +15,10 @@ namespace PlayFlow
         [Header("API Configuration")]
         [Tooltip("Your PlayFlow API key. Get this from your PlayFlow dashboard.")]
         [SerializeField] private string _apiKey;
-        [Tooltip("The base URL for the PlayFlow backend")]
-        [SerializeField] private string _baseUrl = "https://api.scale.computeflow.cloud";
-        [Tooltip("The default lobby configuration name")]
-        [SerializeField] private string _defaultLobbyConfig = "Default";
+        [Tooltip("The base URL for the PlayFlow backend (V3 host only)")]
+        [SerializeField] private string _baseUrl = "https://api.computeflow.cloud";
+        [Tooltip("The default lobby configuration name (V3 default is lowercase 'default')")]
+        [SerializeField] private string _defaultLobbyConfig = "default";
         [Header("Network Settings")]
         [Tooltip("How often to refresh lobby data (in seconds)")]
         [Range(3f, 30f)]
@@ -36,8 +36,12 @@ namespace PlayFlow
         [SerializeField] private float _requestTimeout = 30f;
         [Tooltip("Connection timeout in seconds")]
         [SerializeField] private float _connectionTimeout = 10f;
-        [Header("Heartbeat")]
-        [Tooltip("Enable automatic heartbeat to keep player connection alive")]
+        [Header("Heartbeat (V3: no-op)")]
+        /// <summary>
+        /// V3 deprecated: SSE is the heartbeat. This toggle no longer affects connection health;
+        /// it is retained so existing Inspector-configured scenes do not error.
+        /// </summary>
+        [Tooltip("V3: no-op. SSE is the heartbeat.")]
         [SerializeField] private bool _enableHeartbeat = false;
 
         public bool EnableHeartbeat
@@ -47,15 +51,14 @@ namespace PlayFlow
             {
                 _enableHeartbeat = value;
                 if (_runtimeSettings != null) _runtimeSettings.enableHeartbeat = value;
-
-                if (Application.isPlaying && IsInLobby)
-                {
-                    if (value) StartHeartbeat();
-                    else StopHeartbeat();
-                }
+                // V3: no-op. SSE handles keepalive.
             }
         }
-        [Tooltip("Heartbeat interval in seconds (minimum 15 seconds)")]
+
+        /// <summary>
+        /// V3 deprecated: SSE is the heartbeat. Value is retained but unused at runtime.
+        /// </summary>
+        [Tooltip("V3: ignored. SSE is the heartbeat.")]
         [Range(15f, 300f)]
         [SerializeField] private float _heartbeatInterval = 30f;
         [Header("Debug")]
@@ -69,6 +72,9 @@ namespace PlayFlow
         private bool _hasFiredMatchRunningEvent;
         private HashSet<string> _previousPlayerIds = new HashSet<string>();
         private Coroutine _heartbeatCoroutine;
+        // Set true when the local player explicitly cancels matchmaking so a subsequent
+        // in_queue -> waiting transition is not mis-classified as a timeout.
+        private bool _matchmakingCancelledByUser;
 
         // --- Merged Session state fields ---
         private LobbyState _currentState = LobbyState.Disconnected;
@@ -89,7 +95,7 @@ namespace PlayFlow
         public bool IsInLobby => State == LobbyState.InLobby && _currentLobby != null;
         public string CurrentLobbyId => CurrentLobby?.id;
         public bool IsHost => _currentLobby != null && _currentLobby.host == PlayerId;
-        public string InviteCode => CurrentLobby?.inviteCode;
+        public string InviteCode => CurrentLobby?.code;
         
         // --- Settings access ---
         public string ApiKey => _apiKey;
@@ -172,6 +178,15 @@ namespace PlayFlow
             _playerId = playerId;
             ChangeState(LobbyState.Connected);
             yield return new WaitUntil(() => PlayFlowCore.Instance.LobbyAPI != null);
+
+            // V3: endpoints like GetLobby/ListLobbies don't accept a playerId parameter, so the
+            // API layer needs to know the active player to set the x-player-id header.
+            PlayFlowCore.Instance.LobbyAPI.SetActivePlayerId(playerId);
+
+            // V3: SSE is player-centric and can open before we join any lobby. Tell the refresh
+            // manager a player id exists so it can open the stream now.
+            _refreshManager?.NotifyPlayerIdAvailable();
+
             IsReady = true;
             _events.InvokeConnected();
             onComplete?.Invoke();
@@ -249,16 +264,20 @@ namespace PlayFlow
         public void UpdateStateForPlayer(string targetPlayerId, Dictionary<string, object> state, Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
             if (!ValidateOperation("update state for player", onError)) return;
-            if (!IsHost) { onError?.Invoke("Only the host can update another player's state."); return; }
             if (!IsInLobby) { onError?.Invoke("Not in a lobby"); return; }
             if (string.IsNullOrEmpty(targetPlayerId)) { onError?.Invoke("Target Player ID cannot be empty."); return; }
 
-            var lobbyId = CurrentLobby.id;
-            StartCoroutine(_operations.UpdatePlayerStateCoroutine(lobbyId, PlayerId, targetPlayerId, state, lobby => {
-                if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
-                UpdateCurrentLobby(lobby);
-                onSuccess?.Invoke(lobby);
-            }, onError));
+            // V3 only allows a player to update their OWN state. Hosts cannot push state onto others.
+            // If callers pass their own id, route to UpdatePlayerState; otherwise refuse.
+            if (targetPlayerId != PlayerId)
+            {
+                var msg = "V3 does not allow updating another player's state. Each player must update their own state.";
+                Debug.LogWarning($"[PlayFlowLobbyManager] {msg}");
+                onError?.Invoke(msg);
+                return;
+            }
+
+            UpdatePlayerState(state, onSuccess, onError);
         }
         
         public void GetAvailableLobbies(Action<List<Lobby>> onSuccess, Action<string> onError = null)
@@ -274,9 +293,9 @@ namespace PlayFlow
         {
             if (!ValidateOperation("start match", onError)) return;
             if (!IsHost) { onError?.Invoke("Only the host can start the match."); return; }
-            
+
             var lobbyId = CurrentLobby.id;
-            StartCoroutine(_operations.UpdateLobbyStatusCoroutine(lobbyId, PlayerId, "in_game", lobby => {
+            StartCoroutine(_operations.StartMatchCoroutine(lobbyId, PlayerId, lobby => {
                 if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
                 UpdateCurrentLobby(lobby);
                 _events.InvokeMatchStarted(lobby);
@@ -284,13 +303,30 @@ namespace PlayFlow
             }, onError));
         }
 
+        /// <summary>
+        /// V3 deprecated: there is no EndMatch endpoint. Game servers naturally end the match by
+        /// shutting down. This stub logs a warning and invokes onSuccess with the current lobby so
+        /// existing game code keeps running without errors.
+        /// </summary>
+        /// <summary>
+        /// Host-only. Ends the current match and returns the lobby to 'waiting' so the
+        /// same players can start another round. Stops the game server best-effort.
+        /// Players, invite code, and settings are preserved.
+        /// </summary>
         public void EndMatch(Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
             if (!ValidateOperation("end match", onError)) return;
+            if (!IsInLobby) { onError?.Invoke("Not in a lobby"); return; }
             if (!IsHost) { onError?.Invoke("Only the host can end the match."); return; }
+            if (CurrentLobby?.status != "in_game")
+            {
+                onError?.Invoke($"Can only end a match when lobby is 'in_game' (currently '{CurrentLobby?.status}').");
+                return;
+            }
 
             var lobbyId = CurrentLobby.id;
-            StartCoroutine(_operations.UpdateLobbyStatusCoroutine(lobbyId, PlayerId, "waiting", lobby => {
+            StartCoroutine(_operations.EndMatchCoroutine(lobbyId, PlayerId, lobby =>
+            {
                 if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
                 UpdateCurrentLobby(lobby);
                 _events.InvokeMatchEnded(lobby);
@@ -304,8 +340,9 @@ namespace PlayFlow
             if (!IsHost) { onError?.Invoke("Only the host can start matchmaking."); return; }
             if (string.IsNullOrEmpty(mode)) { onError?.Invoke("Matchmaking mode is required."); return; }
             if (CurrentLobby?.status != "waiting") { onError?.Invoke("Can only start matchmaking when lobby is in 'waiting' status."); return; }
-            
+
             var lobbyId = CurrentLobby.id;
+            _matchmakingCancelledByUser = false;
             StartCoroutine(_operations.StartMatchmakingCoroutine(lobbyId, PlayerId, mode, lobby => {
                 if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
                 UpdateCurrentLobby(lobby);
@@ -313,22 +350,71 @@ namespace PlayFlow
                 onSuccess?.Invoke(lobby);
             }, onError));
         }
-        
+
         public void CancelMatchmaking(Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
             if (!ValidateOperation("cancel matchmaking", onError)) return;
             if (!IsHost) { onError?.Invoke("Only the host can cancel matchmaking."); return; }
             if (CurrentLobby?.status != "in_queue") { onError?.Invoke("Lobby is not currently in matchmaking queue."); return; }
-            
+
             var lobbyId = CurrentLobby.id;
+            _matchmakingCancelledByUser = true;
             StartCoroutine(_operations.CancelMatchmakingCoroutine(lobbyId, PlayerId, lobby => {
+                if (_refreshManager != null && lobby != null) _refreshManager.MarkLocalUpdate(lobby);
+                if (lobby != null) UpdateCurrentLobby(lobby);
+                _events.InvokeMatchmakingCancelled(lobby ?? CurrentLobby);
+                onSuccess?.Invoke(lobby ?? CurrentLobby);
+            }, onError));
+        }
+
+        /// <summary>
+        /// Accept a found match (CS2-style "Accept Match" flow). Any player in the lobby
+        /// can call this — confirmation is per-lobby, parties confirm together.
+        /// When every matched lobby has confirmed, the game server launches automatically
+        /// and all lobbies transition to `in_game`.
+        /// </summary>
+        public void ConfirmMatch(Action<Lobby> onSuccess = null, Action<string> onError = null)
+        {
+            if (!ValidateOperation("confirm match", onError)) return;
+            if (!IsInLobby) { onError?.Invoke("Not in a lobby"); return; }
+            if (CurrentLobby?.status != "match_found")
+            {
+                onError?.Invoke($"Lobby is not awaiting confirmation (status: '{CurrentLobby?.status}').");
+                return;
+            }
+
+            var lobbyId = CurrentLobby.id;
+            StartCoroutine(_operations.ConfirmMatchCoroutine(lobbyId, PlayerId, lobby => {
                 if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
                 UpdateCurrentLobby(lobby);
-                _events.InvokeMatchmakingCancelled(lobby);
                 onSuccess?.Invoke(lobby);
             }, onError));
         }
-        
+
+        /// <summary>
+        /// Decline a found match. Cancels the match for EVERY participating lobby —
+        /// all of them transition back to `in_queue` to search for a new match.
+        /// Any player in any lobby of the match may decline.
+        /// </summary>
+        public void DeclineMatch(Action<Lobby> onSuccess = null, Action<string> onError = null)
+        {
+            if (!ValidateOperation("decline match", onError)) return;
+            if (!IsInLobby) { onError?.Invoke("Not in a lobby"); return; }
+            if (CurrentLobby?.status != "match_found")
+            {
+                onError?.Invoke($"Lobby is not awaiting confirmation (status: '{CurrentLobby?.status}').");
+                return;
+            }
+
+            var lobbyId = CurrentLobby.id;
+            StartCoroutine(_operations.DeclineMatchCoroutine(lobbyId, PlayerId, lobby => {
+                if (_refreshManager != null && lobby != null) _refreshManager.MarkLocalUpdate(lobby);
+                if (lobby != null) UpdateCurrentLobby(lobby);
+                onSuccess?.Invoke(lobby ?? CurrentLobby);
+            }, onError));
+        }
+
+
         public void RefreshCurrentLobby(Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
             if (!ValidateOperation("refresh lobby", onError)) return;
@@ -424,37 +510,83 @@ namespace PlayFlow
             switch (lobby.status)
             {
                 case "in_game":
-                    // Fire OnMatchFound when transitioning from in_queue to in_game (matchmaking flow)
-                    if (oldStatus == "in_queue")
+                    // Fire OnMatchFound when transitioning from a matchmaking-ish state to in_game.
+                    if (oldStatus == "in_queue" || oldStatus == "matched" || oldStatus == "match_found")
                     {
                         _events.InvokeMatchFound(lobby);
+                        _matchmakingCancelledByUser = false;
                     }
 
-                    if (!_hasFiredMatchRunningEvent)
+                    // Fire OnMatchRunning + OnMatchServerDetailsReady once per match when the server reaches running state.
+                    if (!_hasFiredMatchRunningEvent && lobby.server != null && lobby.server.status == "running")
                     {
                         var connectionInfo = GetGameServerConnectionInfo();
                         if (connectionInfo.HasValue)
                         {
                             _events.InvokeMatchRunning(connectionInfo.Value);
-                            _events.InvokeMatchServerDetailsReady(CurrentLobby.GetPortMappings());
+                            _events.InvokeMatchServerDetailsReady(lobby.GetPortMappings());
                             _hasFiredMatchRunningEvent = true;
                         }
                     }
                     break;
 
                 case "waiting":
-                    // Fire OnMatchEnded if transitioning from in_game to waiting (e.g., server shutdown)
+                    // Fire OnMatchEnded if transitioning from in_game to waiting (e.g., server shutdown).
                     if (oldStatus == "in_game")
                     {
                         _events.InvokeMatchEnded(lobby);
                     }
 
-                    // Reset the match running flag when returning to waiting
+                    // V3 matchmaking timeout: matchmaker returns the lobby to `waiting`
+                    // without producing a server. If the local player did not cancel
+                    // explicitly, treat in_queue -> waiting as a timeout.
+                    if (oldStatus == "in_queue")
+                    {
+                        if (_matchmakingCancelledByUser)
+                        {
+                            _matchmakingCancelledByUser = false;
+                        }
+                        else
+                        {
+                            _events.InvokeMatchmakingTimeout(lobby);
+                            _events.InvokeMatchmakingCancelled(lobby);
+                        }
+                    }
+
+                    // V3 match confirmation decline/timeout: matched lobbies return to
+                    // `waiting` when any player declines or the confirmation deadline passes.
+                    if (oldStatus == "match_found")
+                    {
+                        _events.InvokeMatchDeclined(lobby);
+                    }
+
+                    // Reset the match running flag when returning to waiting.
                     _hasFiredMatchRunningEvent = false;
                     break;
 
                 case "in_queue":
-                    // Already handled by FindMatch method
+                    // Matchmaking started — handled by FindMatch() callback.
+                    // Also: if we transitioned from match_found back to in_queue, the match
+                    // was declined or timed out.
+                    if (oldStatus == "match_found")
+                    {
+                        _events.InvokeMatchDeclined(lobby);
+                    }
+                    break;
+
+                case "match_found":
+                    // A match was proposed and requires player confirmation.
+                    // First entry from in_queue: fire OnMatchAwaitingConfirmation.
+                    // Subsequent update (same status, but `confirmation.confirmed` flipped):
+                    // fire OnMatchConfirmed so the UI can show "waiting for others…".
+                    if (oldStatus != "match_found")
+                    {
+                        _events.InvokeMatchAwaitingConfirmation(lobby);
+                    }
+                    else if (lobby.matchmaking?.confirmation?.confirmed == true)
+                    {
+                        _events.InvokeMatchConfirmed(lobby);
+                    }
                     break;
             }
         }
@@ -462,7 +594,8 @@ namespace PlayFlow
         private void CheckForPlayerChanges(Lobby newLobby)
         {
             if (this == null || !gameObject.activeInHierarchy) return;
-            var newPlayerIds = newLobby?.players != null ? new HashSet<string>(newLobby.players) : new HashSet<string>();
+            // V3: `players` is List<LobbyPlayer>; use the PlayerIds helper to compare by id.
+            var newPlayerIds = newLobby != null ? new HashSet<string>(newLobby.PlayerIds) : new HashSet<string>();
 
             // FIRST: Validate that we should still be in this lobby
             // This catches cases where we never tracked previous players or missed updates
@@ -535,16 +668,16 @@ namespace PlayFlow
             }, onError));
         }
 
+        /// <summary>
+        /// V3 deprecated: there is no explicit host-transfer endpoint. The server automatically
+        /// promotes a new host when the current host leaves the lobby. Calling this method logs a
+        /// warning and invokes onError; existing game code should migrate to "leave to transfer".
+        /// </summary>
         public void TransferHost(string newHostId, Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
-            if (!ValidateOperation("transfer host", onError)) return;
-            if (!IsHost) { onError?.Invoke("Only the host can transfer ownership."); return; }
-            if (newHostId == PlayerId) { onError?.Invoke("Cannot transfer host to yourself."); return; }
-            StartCoroutine(_operations.TransferHostCoroutine(CurrentLobbyId, PlayerId, newHostId, lobby => {
-                if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
-                UpdateCurrentLobby(lobby);
-                onSuccess?.Invoke(lobby);
-            }, onError));
+            var msg = "V3 does not support explicit host transfer. The server promotes a new host automatically when the current host leaves.";
+            Debug.LogWarning($"[PlayFlowLobbyManager] {msg}");
+            onError?.Invoke(msg);
         }
 
         public void UpdateLobby(string name = null, int? maxPlayers = null, bool? isPrivate = null, bool? useInviteCode = null, bool? allowLateJoin = null, string region = null, Dictionary<string, object> customSettings = null, Action<Lobby> onSuccess = null, Action<string> onError = null)
@@ -606,77 +739,31 @@ namespace PlayFlow
         public ConnectionInfo? GetGameServerConnectionInfo()
         {
             if (CurrentLobby?.status != "in_game") return null;
-            if (CurrentLobby.gameServer == null || !CurrentLobby.gameServer.ContainsKey("status") || CurrentLobby.gameServer["status"]?.ToString() != "running")
-            {
-                return null;
-            }
+            if (CurrentLobby.server == null || CurrentLobby.server.status != "running") return null;
             return Lobby.GetPrimaryConnectionInfo(CurrentLobby);
         }
 
-        /// <summary>
-        /// Public method to ensure heartbeat is running. Called by refresh manager watchdog.
-        /// </summary>
-        internal void EnsureHeartbeatRunning()
-        {
-            if (_enableHeartbeat && IsInLobby && _heartbeatCoroutine == null)
-            {
-                if (_debugLogging)
-                {
-                    Debug.LogWarning($"[PlayFlowLobbyManager] Heartbeat was stopped! Restarting for lobby {CurrentLobbyId}");
-                }
-                StartHeartbeat();
-            }
-        }
+        // -------------------------------------------------------------------------
+        //  Heartbeat (V3: no-op)
+        //
+        //  V3 uses the SSE connection as the heartbeat — while the player's SSE stream is open,
+        //  the server treats them as alive. These methods are retained as no-ops so existing call
+        //  sites (SetCurrentLobby, ClearCurrentLobby, Disconnect) keep compiling and the public
+        //  EnableHeartbeat surface doesn't break.
+        // -------------------------------------------------------------------------
 
         private void StartHeartbeat()
         {
-            if (!_enableHeartbeat || !IsInLobby) return;
-
-            // Don't restart if already running
-            if (_heartbeatCoroutine != null) return;
-
-            _heartbeatCoroutine = StartCoroutine(HeartbeatCoroutine());
-
-            if (_debugLogging)
-            {
-                Debug.Log($"[PlayFlowLobbyManager] Heartbeat started for lobby {CurrentLobbyId}");
-            }
+            // V3: SSE is the heartbeat. No-op.
         }
 
         private void StopHeartbeat()
         {
+            // V3: SSE is the heartbeat. No-op.
             if (_heartbeatCoroutine != null)
             {
                 StopCoroutine(_heartbeatCoroutine);
                 _heartbeatCoroutine = null;
-
-                if (_debugLogging)
-                {
-                    Debug.Log($"[PlayFlowLobbyManager] Heartbeat stopped");
-                }
-            }
-        }
-
-        private IEnumerator HeartbeatCoroutine()
-        {
-            while (IsInLobby && _enableHeartbeat)
-            {
-                if (_debugLogging)
-                {
-                    Debug.Log($"[PlayFlowLobbyManager] Sending heartbeat for player {PlayerId} in lobby {CurrentLobbyId}");
-                }
-
-                StartCoroutine(_operations.SendHeartbeatCoroutine(CurrentLobbyId, PlayerId,
-                    () => {
-                        if (_debugLogging) Debug.Log("[PlayFlowLobbyManager] Heartbeat sent successfully");
-                    },
-                    error => {
-                        if (_debugLogging) Debug.LogWarning($"[PlayFlowLobbyManager] Heartbeat failed: {error}");
-                    }));
-
-                yield return new WaitForSeconds(_heartbeatInterval);
-
-                if (!IsInLobby || !_enableHeartbeat) break;
             }
         }
     }

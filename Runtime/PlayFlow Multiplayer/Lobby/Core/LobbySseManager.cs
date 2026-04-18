@@ -10,16 +10,22 @@ using Newtonsoft.Json.Linq;
 namespace PlayFlow
 {
     /// <summary>
-    /// Internal SSE manager for real-time lobby updates.
-    /// This is completely transparent to game developers and handles SSE connections behind the scenes.
+    /// Internal SSE manager for real-time lobby updates (V3).
+    /// Connects to GET {baseUrl}/api/v3/lobbies/{config}/me/events with headers:
+    ///   api-key, x-player-id, Accept: text/event-stream, Cache-Control: no-cache
+    /// The server resolves the player's current lobby from x-player-id — no lobbyId required.
+    /// While this SSE is open the server treats the player as alive (no separate heartbeat needed).
+    /// This is completely transparent to game developers.
     /// </summary>
     internal class LobbySseManager : MonoBehaviour
     {
+        // Connection config (V3)
         private string _playerId;
         private string _apiKey;
         private string _lobbyConfigName;
         private string _baseUrl;
-        private string _currentLobbyId;
+
+        // Internal state
         private bool _isConnecting = false;
         private bool _shouldReconnect = true;
         private float _reconnectDelay = 1f;
@@ -28,25 +34,26 @@ namespace PlayFlow
         private int _maxReconnectAttempts = 10;
         private Coroutine _sseCoroutine;
         private Coroutine _reconnectCoroutine;
-        private Coroutine _heartbeatCoroutine;
         private Coroutine _periodicRetryCoroutine;
         private float _lastDataReceived;
         private bool _isPaused = false;
         private float _lastSuccessfulConnection = 0f;
         private bool _hasReachedMaxAttempts = false;
-        private float _periodicRetryInterval = 10f; // Try SSE again every 10 seconds when in polling mode
+        private float _periodicRetryInterval = 10f; // Try SSE again every 10s when in polling mode
         private bool _debugLogging = false;
-        
+        private bool _hasConnectionParams = false;
+
         // Events for internal use
         public event Action OnConnected;
         public event Action OnDisconnected;
         public event Action<Lobby> OnLobbyUpdated;
         public event Action<string> OnLobbyDeleted;
+        public event Action<QueueStats> OnQueueStats;
         public event Action<string> OnError;
-        
+
         // Connection state
         public bool IsConnected { get; private set; } = false;
-        
+
         private static LobbySseManager _instance;
         public static LobbySseManager Instance
         {
@@ -62,7 +69,7 @@ namespace PlayFlow
                 return _instance;
             }
         }
-        
+
         void Awake()
         {
             if (_instance != null && _instance != this)
@@ -72,40 +79,35 @@ namespace PlayFlow
             }
             _instance = this;
         }
-        
+
         /// <summary>
-        /// Initialize SSE manager with connection parameters
+        /// Connect to the V3 player event stream.
+        /// The server resolves the player's current lobby from the x-player-id header —
+        /// no lobbyId is needed. Call Disconnect() to tear down.
         /// </summary>
-        public void Initialize(string playerId, string apiKey, string lobbyConfigName, string baseUrl, bool debugLogging = false)
+        public void Connect(string playerId, string configName, string baseUrl, string apiKey)
         {
-            _playerId = playerId;
-            _apiKey = apiKey;
-            _lobbyConfigName = lobbyConfigName;
-            _baseUrl = baseUrl?.TrimEnd('/');
-            _debugLogging = debugLogging;
-            
-            if (string.IsNullOrEmpty(_baseUrl))
+            if (string.IsNullOrEmpty(playerId))
             {
-                Debug.LogError("[LobbySseManager] Base URL cannot be null or empty");
+                Debug.LogError("[LobbySseManager] Connect called with empty playerId");
                 return;
             }
-            
-            if (_debugLogging)
+            if (string.IsNullOrEmpty(configName))
             {
-                Debug.Log($"[LobbySseManager] Initialized - PlayerId: {_playerId}, Config: {_lobbyConfigName}, URL: {_baseUrl}");
-            }
-        }
-        
-        /// <summary>
-        /// Connect to SSE for a specific lobby
-        /// </summary>
-        public void ConnectToLobby(string lobbyId)
-        {
-            if (string.IsNullOrEmpty(lobbyId) || string.IsNullOrEmpty(_playerId))
-            {
+                Debug.LogError("[LobbySseManager] Connect called with empty configName");
                 return;
             }
-            
+            if (string.IsNullOrEmpty(baseUrl))
+            {
+                Debug.LogError("[LobbySseManager] Connect called with empty baseUrl");
+                return;
+            }
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                Debug.LogError("[LobbySseManager] Connect called with empty apiKey");
+                return;
+            }
+
             // Check platform support
             if (!PlatformSSEHandler.IsSSESupported())
             {
@@ -113,45 +115,81 @@ namespace PlayFlow
                 OnError?.Invoke("SSE not supported on this platform, using polling instead");
                 return;
             }
-            
-            if (_debugLogging)
-            {
-                Debug.Log($"[LobbySseManager] ConnectToLobby called for lobby: {lobbyId}, player: {_playerId}");
-            }
-            
-            // Disconnect from previous lobby if any
-            if (_currentLobbyId != lobbyId)
-            {
-                StopConnectionCoroutines(false); // Stop connection but don't clear lobbyId yet
-            }
-            
-            _currentLobbyId = lobbyId;
+
+            _playerId = playerId;
+            _lobbyConfigName = configName;
+            _baseUrl = baseUrl.TrimEnd('/');
+            _apiKey = apiKey;
+            _hasConnectionParams = true;
             _shouldReconnect = true;
-            
-            // Reset retry state when connecting to a new lobby
+
+            // Reset retry state for a fresh connection
             _reconnectAttempts = 0;
             _reconnectDelay = 1f;
             _hasReachedMaxAttempts = false;
-            
+
+            if (_debugLogging)
+            {
+                Debug.Log($"[LobbySseManager] Connect - PlayerId: {_playerId}, Config: {_lobbyConfigName}, URL: {_baseUrl}");
+            }
+
+            // Stop any in-flight connection before starting a new one
+            StopConnectionCoroutines(false);
+
             if (_sseCoroutine == null && !_isPaused)
             {
                 _sseCoroutine = StartCoroutine(SSEConnectionCoroutine());
             }
-            
-            // Start periodic retry if not already running
+
             if (_periodicRetryCoroutine == null)
             {
                 _periodicRetryCoroutine = StartCoroutine(PeriodicSSERetryCoroutine());
             }
         }
-        
+
         /// <summary>
-        /// Disconnect from current SSE connection and clear lobby context.
+        /// Deprecated V2 entrypoint — forwards to Connect(). debugLogging is preserved.
+        /// Kept for backward compatibility until Phase 3 updates callers.
+        /// </summary>
+        public void Initialize(string playerId, string apiKey, string lobbyConfigName, string baseUrl, bool debugLogging = false)
+        {
+            _debugLogging = debugLogging;
+            _playerId = playerId;
+            _apiKey = apiKey;
+            _lobbyConfigName = lobbyConfigName;
+            _baseUrl = baseUrl?.TrimEnd('/');
+            _hasConnectionParams = !string.IsNullOrEmpty(_playerId)
+                                && !string.IsNullOrEmpty(_apiKey)
+                                && !string.IsNullOrEmpty(_lobbyConfigName)
+                                && !string.IsNullOrEmpty(_baseUrl);
+
+            if (_debugLogging)
+            {
+                Debug.Log($"[LobbySseManager] Initialized (legacy) - PlayerId: {_playerId}, Config: {_lobbyConfigName}, URL: {_baseUrl}");
+            }
+        }
+
+        /// <summary>
+        /// Deprecated V2 entrypoint. V3: lobbyId is ignored — server resolves the lobby
+        /// from x-player-id. Forwards to Connect() using previously-initialized params.
+        /// </summary>
+        public void ConnectToLobby(string lobbyId)
+        {
+            // V3: lobbyId is ignored, server resolves via x-player-id
+            if (!_hasConnectionParams)
+            {
+                Debug.LogWarning("[LobbySseManager] ConnectToLobby called before Initialize()");
+                return;
+            }
+            Connect(_playerId, _lobbyConfigName, _baseUrl, _apiKey);
+        }
+
+        /// <summary>
+        /// Disconnect from the current SSE connection.
         /// </summary>
         public void Disconnect()
         {
             _shouldReconnect = false;
-            _currentLobbyId = null;
             StopConnectionCoroutines(true);
         }
 
@@ -166,7 +204,7 @@ namespace PlayFlow
                 Debug.Log("[LobbySseManager] Pausing SSE connection.");
             }
             _isPaused = true;
-            StopConnectionCoroutines(false); // Stop connection but keep lobby context
+            StopConnectionCoroutines(false); // Stop connection but keep params for resume
         }
 
         /// <summary>
@@ -180,19 +218,27 @@ namespace PlayFlow
                 Debug.Log("[LobbySseManager] Resuming SSE connection.");
             }
             _isPaused = false;
-            
-            // Re-trigger connection if we have a lobby ID and are not already connecting
-            if (!string.IsNullOrEmpty(_currentLobbyId) && _sseCoroutine == null)
+
+            if (_hasConnectionParams && _sseCoroutine == null && _shouldReconnect)
             {
-                ConnectToLobby(_currentLobbyId);
+                // Reset retry state so resume gets a fresh attempt
+                _reconnectAttempts = 0;
+                _reconnectDelay = 1f;
+                _hasReachedMaxAttempts = false;
+                _sseCoroutine = StartCoroutine(SSEConnectionCoroutine());
+
+                if (_periodicRetryCoroutine == null)
+                {
+                    _periodicRetryCoroutine = StartCoroutine(PeriodicSSERetryCoroutine());
+                }
             }
         }
 
-        private void StopConnectionCoroutines(bool clearLobbyId)
+        private void StopConnectionCoroutines(bool clearParams)
         {
-            if (clearLobbyId)
+            if (clearParams)
             {
-                _currentLobbyId = null;
+                _hasConnectionParams = false;
             }
 
             if (_sseCoroutine != null)
@@ -200,7 +246,7 @@ namespace PlayFlow
                 StopCoroutine(_sseCoroutine);
                 _sseCoroutine = null;
             }
-            
+
             if (_reconnectCoroutine != null)
             {
                 StopCoroutine(_reconnectCoroutine);
@@ -214,46 +260,47 @@ namespace PlayFlow
             }
 
             _isConnecting = false;
-            
+
             if (IsConnected)
             {
                 IsConnected = false;
                 OnDisconnected?.Invoke();
             }
         }
-        
+
         private IEnumerator SSEConnectionCoroutine()
         {
             if (_isConnecting)
             {
                 yield break;
             }
-            
+
             _isConnecting = true;
-            
-            // Build SSE URL
-            string sseUrl = $"{_baseUrl}/lobbies-sse/{_currentLobbyId}/events";
-            string queryString = $"?player-id={UnityWebRequest.EscapeURL(_playerId)}&lobby-config={UnityWebRequest.EscapeURL(_lobbyConfigName)}";
-            string fullUrl = sseUrl + queryString;
-            
+
+            // V3: GET {baseUrl}/api/v3/lobbies/{config}/me/events
+            // api-key and x-player-id are HEADERS now (not query params).
+            string encodedConfig = UnityWebRequest.EscapeURL(_lobbyConfigName);
+            string fullUrl = $"{_baseUrl}/api/v3/lobbies/{encodedConfig}/me/events";
+
             if (_debugLogging)
             {
-                Debug.Log($"[LobbySseManager] Connecting to SSE URL: {fullUrl}");
+                Debug.Log($"[LobbySseManager] Connecting to SSE URL: {fullUrl} (player: {_playerId})");
             }
-            
+
             using (var request = UnityWebRequest.Get(fullUrl))
             {
                 request.SetRequestHeader("api-key", _apiKey);
+                request.SetRequestHeader("x-player-id", _playerId);
                 request.SetRequestHeader("Accept", "text/event-stream");
                 request.SetRequestHeader("Cache-Control", "no-cache");
                 request.downloadHandler = new SSEDownloadHandler(this);
-                
+
                 yield return request.SendWebRequest();
-                
+
                 if (request.result != UnityWebRequest.Result.Success)
                 {
                     // Unity can report "Unknown Error" with HTTP 200 on a clean SSE stream closure.
-                    // We should handle this gracefully and not treat it as a critical error.
+                    // Handle this gracefully — not a critical error.
                     bool isCleanClosure = request.responseCode == 200 && request.error == "Unknown Error";
 
                     if (!isCleanClosure)
@@ -266,36 +313,35 @@ namespace PlayFlow
                     {
                         Debug.Log("[LobbySseManager] SSE stream closed by the server (HTTP 200). This is usually normal.");
                     }
-                    
-                    // In either case, attempt to reconnect if we are supposed to.
+
                     if (_shouldReconnect && _reconnectCoroutine == null && !_isPaused)
                     {
                         _reconnectCoroutine = StartCoroutine(ReconnectCoroutine());
                     }
                 }
             }
-            
+
             _isConnecting = false;
             _sseCoroutine = null;
-            
+
             if (IsConnected)
             {
                 IsConnected = false;
                 OnDisconnected?.Invoke();
             }
         }
-        
+
         private IEnumerator ReconnectCoroutine()
         {
             // Exponential backoff with jitter
             float jitter = UnityEngine.Random.Range(0.5f, 1.5f);
             float delay = Mathf.Min(_reconnectDelay * jitter, _maxReconnectDelay);
-            
+
             yield return new WaitForSeconds(delay);
-            
+
             _reconnectCoroutine = null;
             _reconnectAttempts++;
-            
+
             if (_reconnectAttempts >= _maxReconnectAttempts)
             {
                 if (!_hasReachedMaxAttempts)
@@ -307,14 +353,13 @@ namespace PlayFlow
                         Debug.Log("[LobbySseManager] Max reconnect attempts reached. Switching to periodic retry mode.");
                     }
                 }
-                // Don't set _shouldReconnect = false anymore - let periodic retry handle it
+                // Fall through to periodic retry — don't set _shouldReconnect = false.
                 yield break;
             }
-            
-            // Increase delay for next attempt (exponential backoff)
+
             _reconnectDelay = Mathf.Min(_reconnectDelay * 2f, _maxReconnectDelay);
-            
-            if (_shouldReconnect && !string.IsNullOrEmpty(_currentLobbyId) && !_isPaused)
+
+            if (_shouldReconnect && _hasConnectionParams && !_isPaused)
             {
                 if (_sseCoroutine == null)
                 {
@@ -322,86 +367,114 @@ namespace PlayFlow
                 }
             }
         }
-        
+
         internal void HandleSSEMessage(string eventType, string data)
         {
             _lastDataReceived = Time.time;
             _lastSuccessfulConnection = Time.time;
-            _reconnectAttempts = 0; // Reset on successful data
-            _reconnectDelay = 1f; // Reset delay on success
-            _hasReachedMaxAttempts = false; // Reset max attempts flag
-            
+            _reconnectAttempts = 0;
+            _reconnectDelay = 1f;
+            _hasReachedMaxAttempts = false;
+
             try
             {
                 switch (eventType)
                 {
                     case "connected":
+                    {
+                        // V3: data IS the lobby (NOT wrapped in { lobby: ... })
                         if (_debugLogging)
                         {
-                            Debug.Log($"[LobbySseManager] Received 'connected' event");
+                            Debug.Log("[LobbySseManager] Received 'connected' event");
                         }
-                        var connectedData = JObject.Parse(data);
-                        var lobby = connectedData["lobby"]?.ToObject<Lobby>();
-                        if (lobby != null)
+                        var lobby = JsonConvert.DeserializeObject<Lobby>(data);
+                        // Always fire OnConnected — even if the player isn't currently in a lobby
+                        // the stream is still live (server may send lobby_updated later).
+                        if (!IsConnected)
                         {
                             IsConnected = true;
-                            _lastSuccessfulConnection = Time.time;
                             OnConnected?.Invoke();
-                            OnLobbyUpdated?.Invoke(lobby);
                             if (_debugLogging)
                             {
-                                Debug.Log("[LobbySseManager] ✅ SSE connection established successfully");
+                                Debug.Log("[LobbySseManager] SSE connection established successfully");
                             }
                         }
+                        if (lobby != null && !string.IsNullOrEmpty(lobby.id))
+                        {
+                            OnLobbyUpdated?.Invoke(lobby);
+                        }
                         break;
-                        
-                    case "lobby:updated":
+                    }
+
+                    case "lobby_updated":
+                    {
                         var updatedLobby = JsonConvert.DeserializeObject<Lobby>(data);
                         if (updatedLobby != null)
                         {
                             OnLobbyUpdated?.Invoke(updatedLobby);
                         }
                         break;
-                        
-                    case "lobby:deleted":
+                    }
+
+                    case "queue_stats":
+                    {
+                        var stats = JsonConvert.DeserializeObject<QueueStats>(data);
+                        if (stats != null)
+                        {
+                            OnQueueStats?.Invoke(stats);
+                        }
+                        break;
+                    }
+
+                    case "lobby_deleted":
+                    {
                         var deletedData = JObject.Parse(data);
-                        var lobbyId = deletedData["lobbyId"]?.ToString();
+                        var lobbyId = deletedData["id"]?.ToString();
                         if (!string.IsNullOrEmpty(lobbyId))
                         {
                             OnLobbyDeleted?.Invoke(lobbyId);
+                        }
+                        break;
+                    }
+
+                    case "ping":
+                        // V3 keepalive — ignore silently (arrival already reset reconnect state above)
+                        break;
+
+                    default:
+                        if (_debugLogging)
+                        {
+                            Debug.Log($"[LobbySseManager] Unknown SSE event: {eventType}");
                         }
                         break;
                 }
             }
             catch (Exception e)
             {
-                OnError?.Invoke($"Failed to parse SSE message: {e.Message}");
+                OnError?.Invoke($"Failed to parse SSE message ({eventType}): {e.Message}");
             }
         }
-        
+
         /// <summary>
-        /// Periodically attempts to reconnect to SSE when in polling mode
+        /// Periodically attempts to reconnect to SSE when in polling-fallback mode.
         /// </summary>
         private IEnumerator PeriodicSSERetryCoroutine()
         {
             while (true)
             {
                 yield return new WaitForSeconds(_periodicRetryInterval);
-                
-                // Only retry if we're not connected, have a lobby, and have reached max attempts
-                if (!IsConnected && !string.IsNullOrEmpty(_currentLobbyId) && _hasReachedMaxAttempts && !_isPaused)
+
+                if (!IsConnected && _hasConnectionParams && _hasReachedMaxAttempts && !_isPaused)
                 {
                     if (_debugLogging)
                     {
                         Debug.Log("[LobbySseManager] Attempting periodic SSE reconnection...");
                     }
-                    
-                    // Reset retry state for a fresh attempt
+
                     _reconnectAttempts = 0;
                     _reconnectDelay = 1f;
                     _hasReachedMaxAttempts = false;
-                    
-                    // Try to connect again
+
                     if (_sseCoroutine == null)
                     {
                         _sseCoroutine = StartCoroutine(SSEConnectionCoroutine());
@@ -409,19 +482,19 @@ namespace PlayFlow
                 }
             }
         }
-        
+
         void OnDestroy()
         {
             Disconnect();
-            
+
             if (_instance == this)
             {
                 _instance = null;
             }
         }
-        
+
         /// <summary>
-        /// Custom download handler for SSE that processes the stream as it arrives
+        /// Custom download handler for SSE that processes the stream as it arrives.
         /// </summary>
         private class SSEDownloadHandler : DownloadHandlerScript
         {
@@ -429,24 +502,24 @@ namespace PlayFlow
             private StringBuilder _buffer = new StringBuilder();
             private string _currentEventType = "";
             private StringBuilder _currentData = new StringBuilder();
-            
+
             public SSEDownloadHandler(LobbySseManager manager) : base()
             {
                 _manager = manager;
             }
-            
+
             protected override bool ReceiveData(byte[] data, int dataLength)
             {
                 if (data == null || dataLength == 0)
                     return true;
-                
+
                 string text = Encoding.UTF8.GetString(data, 0, dataLength);
                 _buffer.Append(text);
-                
+
                 // Process complete lines
                 string bufferContent = _buffer.ToString();
                 string[] lines = bufferContent.Split('\n');
-                
+
                 // Keep the last incomplete line in the buffer
                 _buffer.Clear();
                 if (!bufferContent.EndsWith("\n"))
@@ -454,21 +527,21 @@ namespace PlayFlow
                     _buffer.Append(lines[lines.Length - 1]);
                     lines = lines.Take(lines.Length - 1).ToArray();
                 }
-                
+
                 foreach (string line in lines)
                 {
                     ProcessLine(line.TrimEnd('\r'));
                 }
-                
+
                 return true;
             }
-            
+
             private void ProcessLine(string line)
             {
                 if (string.IsNullOrEmpty(line))
                 {
                     // Empty line signals end of event
-                    if (!string.IsNullOrEmpty(_currentEventType) && _currentData.Length > 0)
+                    if (!string.IsNullOrEmpty(_currentEventType))
                     {
                         _manager.HandleSSEMessage(_currentEventType, _currentData.ToString());
                         _currentEventType = "";
@@ -476,7 +549,7 @@ namespace PlayFlow
                     }
                     return;
                 }
-                
+
                 if (line.StartsWith("event: "))
                 {
                     _currentEventType = line.Substring(7);
@@ -488,11 +561,11 @@ namespace PlayFlow
                     _currentData.Append(line.Substring(6));
                 }
             }
-            
+
             protected override void CompleteContent()
             {
                 // Process any remaining data
-                if (!string.IsNullOrEmpty(_currentEventType) && _currentData.Length > 0)
+                if (!string.IsNullOrEmpty(_currentEventType))
                 {
                     _manager.HandleSSEMessage(_currentEventType, _currentData.ToString());
                 }

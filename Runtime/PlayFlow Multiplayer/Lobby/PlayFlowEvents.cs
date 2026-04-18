@@ -29,7 +29,10 @@ namespace PlayFlow
 
     [System.Serializable]
     public class PortMappingInfoListEvent : UnityEvent<List<PortMappingInfo>> { }
-    
+
+    [System.Serializable]
+    public class QueueStatsEvent : UnityEvent<QueueStats> { }
+
     [System.Serializable]
     public class StateChangedEvent : UnityEvent<LobbyState, LobbyState> { }
     
@@ -73,12 +76,24 @@ namespace PlayFlow
         
         [Tooltip("Fired when a match is found through matchmaking")]
         public LobbyEvent OnMatchFound = new LobbyEvent();
-        
+
+        [Tooltip("Fired when matchmaking finds a match that requires confirmation. Players have `matchmaking.confirmation.deadline` seconds to accept or the match is cancelled.")]
+        public LobbyEvent OnMatchAwaitingConfirmation = new LobbyEvent();
+
+        [Tooltip("Fired when this lobby has confirmed a found match but is waiting on others.")]
+        public LobbyEvent OnMatchConfirmed = new LobbyEvent();
+
+        [Tooltip("Fired when a found match was declined or timed out — lobby is back in queue.")]
+        public LobbyEvent OnMatchDeclined = new LobbyEvent();
+
         [Tooltip("Fired when matchmaking is cancelled")]
         public LobbyEvent OnMatchmakingCancelled = new LobbyEvent();
         
         [Tooltip("Fired when matchmaking times out")]
         public LobbyEvent OnMatchmakingTimeout = new LobbyEvent();
+
+        [Tooltip("Fired periodically (every ~10s) with matchmaking queue statistics while in queue")]
+        public QueueStatsEvent OnQueueStats = new QueueStatsEvent();
         
         [Header("Player Events")]
         [Tooltip("Fired when a player joins the lobby")]
@@ -154,7 +169,23 @@ namespace PlayFlow
         {
             SafeInvoke(() => OnMatchFound?.Invoke(lobby), "MatchFound", lobby);
         }
-        
+
+        public void InvokeMatchAwaitingConfirmation(Lobby lobby)
+        {
+            SafeInvoke(() => OnMatchAwaitingConfirmation?.Invoke(lobby), "MatchAwaitingConfirmation", lobby);
+        }
+
+        public void InvokeMatchConfirmed(Lobby lobby)
+        {
+            SafeInvoke(() => OnMatchConfirmed?.Invoke(lobby), "MatchConfirmed", lobby);
+        }
+
+        public void InvokeMatchDeclined(Lobby lobby)
+        {
+            SafeInvoke(() => OnMatchDeclined?.Invoke(lobby), "MatchDeclined", lobby);
+        }
+
+
         public void InvokeMatchmakingCancelled(Lobby lobby)
         {
             SafeInvoke(() => OnMatchmakingCancelled?.Invoke(lobby), "MatchmakingCancelled", lobby);
@@ -163,6 +194,11 @@ namespace PlayFlow
         public void InvokeMatchmakingTimeout(Lobby lobby)
         {
             SafeInvoke(() => OnMatchmakingTimeout?.Invoke(lobby), "MatchmakingTimeout", lobby);
+        }
+
+        public void InvokeQueueStats(QueueStats stats)
+        {
+            SafeInvoke(() => OnQueueStats?.Invoke(stats), "QueueStats", stats);
         }
         
         public void InvokePlayerJoined(PlayerAction action)

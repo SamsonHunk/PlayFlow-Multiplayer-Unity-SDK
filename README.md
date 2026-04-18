@@ -26,7 +26,7 @@
 |---|---|---|
 | **🚀 One-Click Server Hosting** | Build and deploy dedicated Linux servers for your game directly from the Unity Editor. No command-line or Docker knowledge required. | `PlayFlowCloudDeploy` Window |
 | **🤝 Modern Lobby System** | A powerful, event-driven system for creating and managing game lobbies. Fully compatible with WebGL, consoles, and PC. | `PlayFlowLobbyManagerV2` |
-| **⚔️ Ticket-Based Matchmaking** | A flexible client for connecting players based on skill, region, or custom game attributes. | `PlayFlowMatchmakerManager` |
+| **⚔️ Rules-Based Matchmaking** | Match by skill, version, region, or any custom rule via CEL expressions. Configurable "Accept Match" dialog, auto-expanding skill buckets, party queueing. | `PlayFlowLobbyManagerV2.FindMatch()` |
 | **🎮 Direct Server API** | Programmatic C# access to manage your entire game server fleet for advanced, custom scaling logic. | `PlayflowServerApiClient` |
 
 ---
@@ -127,59 +127,88 @@ public class LobbyExample : MonoBehaviour
 
 ### 3. Find a Match
 
-The `PlayFlowMatchmakerManager` uses a simple, ticket-based system to find matches for your players.
+Matchmaking is part of the same `PlayFlowLobbyManagerV2`. You configure matchmaking **modes** (1v1, 5v5, FFA, asymmetric roles, …) in the [dashboard](https://app.playflowcloud.com), then queue for them from your lobby. When opponents are found, every matched lobby transitions to `in_game` with the same `matchId` and the same game server.
 
 ```csharp
 using UnityEngine;
 using PlayFlow;
-using System;
-using System.Threading;
-using System.Threading.Tasks;
-using Newtonsoft.Json.Linq; // Add this for JObject handling
 
 public class MatchmakingExample : MonoBehaviour
 {
-    public async void FindMatch()
+    void Start()
     {
-        var matchRequest = new PlayFlowMatchmakerManager.MatchRequest(
-            matchmakerName: "my-default-matchmaker", 
-            playerId: "player-12345"
+        var events = PlayFlowLobbyManagerV2.Instance.Events;
+
+        // Fired when opponents are found + the server transitions to running
+        events.OnMatchFound.AddListener(lobby =>
+        {
+            // Look up by the port name you defined in the dashboard
+            if (lobby.TryGetPort("game_udp", out var port))
+                Debug.Log($"Connect to {port.host}:{port.external_port}");
+        });
+
+        // Live queue telemetry — "42 players searching, ~12s avg wait"
+        events.OnQueueStats.AddListener(stats =>
+            Debug.Log($"Searching: {stats.playersSearching} players, avg wait {stats.avgWaitSeconds}s"));
+    }
+
+    // Host queues the lobby for a specific mode (must exist in your dashboard config)
+    public void QueueRanked1v1()
+    {
+        PlayFlowLobbyManagerV2.Instance.FindMatch(
+            mode: "ranked_1v1",
+            onSuccess: lobby => Debug.Log($"In queue. Status: {lobby.status}"),
+            onError: err => Debug.LogError($"Matchmaking failed: {err}")
         );
+    }
 
-        // Optionally add more criteria
-        matchRequest.Elo = 1200;
-        matchRequest.CustomFields.Add("gameMode", "CaptureTheFlag");
-
-        Debug.Log("Finding match...");
-        try
-        {
-            var matchedTicket = await PlayFlowMatchmakerManager.Instance.FindMatchAsync(
-                request: matchRequest,
-                timeout: TimeSpan.FromSeconds(60) // Wait for up to 60 seconds
-            );
-
-            Debug.Log("Match Found!");
-            
-            // Extract server details from the match ticket
-            string ip = matchedTicket["server"]?["network_ports"]?[0]?["host"]?.ToString();
-            int port = matchedTicket["server"]?["network_ports"]?[0]?["external_port"]?.ToObject<int>() ?? 0;
-
-            Debug.Log($"Connect to server at {ip}:{port}");
-            
-            // Connect your networking client (Netcode, Mirror, etc.) here
-
-        }
-        catch (TaskCanceledException)
-        {
-            Debug.LogWarning("Matchmaking timed out or was canceled.");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError($"An error occurred during matchmaking: {e.Message}");
-        }
+    // Cancel searching — back to 'waiting'
+    public void StopSearching()
+    {
+        PlayFlowLobbyManagerV2.Instance.CancelMatchmaking();
     }
 }
 ```
+
+**Matchmaking rules** (defined per mode in the dashboard) shape who matches with whom. PlayFlow ships 5 primitives: `difference` (skill buckets), `equals` (same version/map), `not_equals` (anti-rematch), `region` (overlap), `expression` (CEL for anything custom). See the [matchmaking guide](https://docs.playflowcloud.com/lobbies/matchmaking) for examples.
+
+### 4. CS2-Style "Accept Match" flow (optional)
+
+If your mode has `matchConfirmation.enabled: true` in the dashboard, matches pause at `match_found` for players to accept or decline before the server launches.
+
+```csharp
+var events = PlayFlowLobbyManagerV2.Instance.Events;
+
+events.OnMatchAwaitingConfirmation.AddListener(lobby =>
+{
+    // Show your "Accept Match" dialog
+    var deadline = lobby.matchmaking.confirmation.deadline;
+    Debug.Log($"Match found! Accept within deadline: {deadline}");
+});
+
+events.OnMatchConfirmed.AddListener(_ =>
+    Debug.Log("You accepted. Waiting on other players…"));
+
+events.OnMatchDeclined.AddListener(_ =>
+    Debug.Log("Match cancelled. Everyone is back in 'waiting' — re-queue when ready."));
+
+// Wired to your UI buttons
+void OnAcceptClicked()  => PlayFlowLobbyManagerV2.Instance.ConfirmMatch();
+void OnDeclineClicked() => PlayFlowLobbyManagerV2.Instance.DeclineMatch();
+```
+
+If any player declines or the timeout expires, **all** participating lobbies return to `waiting` — players explicitly re-queue when ready.
+
+### 5. Rematch (keep the same lobby)
+
+When a match ends, the host can recycle the lobby for another round instead of re-inviting everyone:
+
+```csharp
+// Host only. Stops the game server, returns lobby to 'waiting', keeps players + invite code.
+PlayFlowLobbyManagerV2.Instance.EndMatch();
+```
+
+If the game server stops on its own (TTL, crash, clean exit), the lobby **auto-heals** to `waiting` with the same effect — no call needed.
 
 ## Documentation & Support
 
