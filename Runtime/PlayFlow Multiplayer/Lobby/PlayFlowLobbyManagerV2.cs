@@ -193,10 +193,20 @@ namespace PlayFlow
             if (_debugLogging) { Debug.Log($"[PlayFlowLobbyManager] Initialized successfully for player: {playerId}"); }
         }
         
-        public void CreateLobby(string name, int maxPlayers, bool isPrivate, bool allowLateJoin, string region, Dictionary<string, object> customSettings, Action<Lobby> onSuccess = null, Action<string> onError = null)
+        /// <summary>
+        /// Create a new lobby. The local player becomes the host.
+        /// </summary>
+        /// <param name="forceFresh">
+        /// When true, the backend deletes any lobby the local player currently hosts in
+        /// this config before creating the new one. Use this for "start a fresh session"
+        /// flows where the host may be reconnecting from a prior session — it replaces
+        /// the old manual "TryReconnect → DeleteLobby → CreateLobby" dance with a single
+        /// atomic call. No-op when the player has no existing lobby.
+        /// </param>
+        public void CreateLobby(string name, int maxPlayers, bool isPrivate, bool allowLateJoin, string region, Dictionary<string, object> customSettings, bool forceFresh = false, Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
             if (!ValidateOperation("create lobby", onError)) return;
-            StartCoroutine(_operations.CreateLobbyCoroutine(name, maxPlayers, isPrivate, allowLateJoin, region, customSettings, PlayerId, lobby => {
+            StartCoroutine(_operations.CreateLobbyCoroutine(name, maxPlayers, isPrivate, allowLateJoin, region, customSettings, forceFresh, PlayerId, lobby => {
                 // Mark this update before setting to prevent race condition with refresh
                 if (_refreshManager != null) _refreshManager.MarkLocalUpdate(lobby);
                 SetCurrentLobby(lobby);
@@ -204,10 +214,25 @@ namespace PlayFlow
                 onSuccess?.Invoke(lobby);
             }, onError));
         }
-        
-        public void CreateLobby(string name, int maxPlayers = 4, bool isPrivate = false, Action<Lobby> onSuccess = null, Action<string> onError = null)
+
+        /// <summary>
+        /// Simple CreateLobby overload with sensible defaults. Pass <paramref name="forceFresh"/>
+        /// = true to replace any lobby the local player currently hosts.
+        /// </summary>
+        public void CreateLobby(string name, int maxPlayers = 4, bool isPrivate = false, bool forceFresh = false, Action<Lobby> onSuccess = null, Action<string> onError = null)
         {
-            CreateLobby(name, maxPlayers, isPrivate, true, "us-west", new Dictionary<string, object>(), onSuccess, onError);
+            CreateLobby(name, maxPlayers, isPrivate, true, "us-west", new Dictionary<string, object>(), forceFresh, onSuccess, onError);
+        }
+
+        /// <summary>
+        /// Shorthand for <c>CreateLobby(..., forceFresh: true)</c>. The backend first deletes
+        /// any lobby this player already hosts (stopping its game server best-effort), then
+        /// creates a brand-new lobby atomically. Useful for reconnect flows where the host
+        /// wants to start a clean session without manually cleaning up prior state.
+        /// </summary>
+        public void CreateFreshLobby(string name, int maxPlayers = 4, bool isPrivate = false, Action<Lobby> onSuccess = null, Action<string> onError = null)
+        {
+            CreateLobby(name, maxPlayers, isPrivate, true, "us-west", new Dictionary<string, object>(), true, onSuccess, onError);
         }
         
         public void JoinLobby(string lobbyId, Action<Lobby> onSuccess = null, Action<string> onError = null)

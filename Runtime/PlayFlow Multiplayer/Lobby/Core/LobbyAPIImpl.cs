@@ -79,6 +79,7 @@ namespace PlayFlow
             bool allowLateJoin,
             string region,
             Dictionary<string, object> customSettings,
+            bool forceFresh,
             string playerId,
             Action<Lobby> onSuccess,
             Action<string> onError)
@@ -96,6 +97,8 @@ namespace PlayFlow
             };
             if (!string.IsNullOrEmpty(region)) payload["region"] = region;
             if (customSettings != null) payload["settings"] = JObject.FromObject(customSettings);
+            // Only serialize when true — backend default (false) matches the optional schema.
+            if (forceFresh) payload["forceFresh"] = true;
 
             // Remember the player id for subsequent /me calls.
             if (!string.IsNullOrEmpty(playerId)) _activePlayerId = playerId;

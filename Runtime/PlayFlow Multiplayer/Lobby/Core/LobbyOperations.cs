@@ -21,7 +21,7 @@ namespace PlayFlow
             _events = events;
         }
 
-        public IEnumerator CreateLobbyCoroutine(string lobbyName, int maxPlayers, bool isPrivate, bool allowLateJoin, string region, Dictionary<string, object> customSettings, string playerId, Action<Lobby> onSuccess, Action<string> onError)
+        public IEnumerator CreateLobbyCoroutine(string lobbyName, int maxPlayers, bool isPrivate, bool allowLateJoin, string region, Dictionary<string, object> customSettings, bool forceFresh, string playerId, Action<Lobby> onSuccess, Action<string> onError)
         {
             if (_api == null)
             {
@@ -29,7 +29,7 @@ namespace PlayFlow
                 yield break;
             }
 
-            yield return _api.CreateLobby(_settings.defaultLobbyConfig, lobbyName, maxPlayers, isPrivate, allowLateJoin, region, customSettings, playerId, onSuccess, onError);
+            yield return _api.CreateLobby(_settings.defaultLobbyConfig, lobbyName, maxPlayers, isPrivate, allowLateJoin, region, customSettings, forceFresh, playerId, onSuccess, onError);
         }
 
         public IEnumerator JoinLobbyCoroutine(string lobbyId, string playerId, Action<Lobby> onSuccess, Action<string> onError)

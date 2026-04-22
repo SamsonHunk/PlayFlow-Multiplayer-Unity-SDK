@@ -24,6 +24,8 @@ namespace PlayFlow
         void SetActivePlayerId(string playerId);
 
         // Create lobby. `playerId` is used for the `x-player-id` header (V3 resolves host from it).
+        // When `forceFresh` is true, the backend deletes any lobby the caller already hosts in
+        // this config before creating the new one. No-op when the caller has no prior lobby.
         IEnumerator CreateLobby(
             string configName,
             string lobbyName,
@@ -32,6 +34,7 @@ namespace PlayFlow
             bool allowLateJoin,
             string region,
             Dictionary<string, object> customSettings,
+            bool forceFresh,
             string playerId,
             Action<Lobby> onSuccess,
             Action<string> onError);
