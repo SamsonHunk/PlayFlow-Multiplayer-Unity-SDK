@@ -21,7 +21,7 @@ namespace PlayFlow
         private readonly string _baseUrl;
         private readonly string _apiKey;
         private readonly INetworkManager _networkManager;
-        private readonly string _lobbyConfigName;
+        private string _lobbyConfigName;
 
         private string _activePlayerId;
 
@@ -84,6 +84,7 @@ namespace PlayFlow
             Action<Lobby> onSuccess,
             Action<string> onError)
         {
+            _lobbyConfigName = configName;
             // V3: configName on the creating call must match the configured config; we still use the
             // LobbyAPIImpl's stored config name for the URL path.
             var url = BuildUrl(string.Empty);
