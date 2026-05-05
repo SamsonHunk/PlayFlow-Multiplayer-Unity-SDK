@@ -463,6 +463,7 @@ namespace PlayFlow
             _playerId = null;
             ChangeState(LobbyState.Disconnected);
             _events.InvokeDisconnected();
+            IsReady = false;
         }
         
         private bool ValidateOperation(string operation, Action<string> onError)
